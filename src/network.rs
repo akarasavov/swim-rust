@@ -2,6 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, mpsc};
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
@@ -13,8 +14,8 @@ struct UdpServer {
 }
 
 impl UdpServer {
-    fn new(address: SocketAddr) -> UdpServer {
-        return UdpServer { address, cancellation_token: CancellationToken::new() };
+    fn new(address: SocketAddr, cancellation_token: CancellationToken) -> UdpServer {
+        return UdpServer { address, cancellation_token };
     }
 
     async fn start(self) -> anyhow::Result<Receiver<UdpMessage>> {
@@ -25,6 +26,7 @@ impl UdpServer {
         tokio::spawn(async move {
             tokio::select! {
                 _ = self.cancellation_token.cancelled() => {
+                    println!("Stop udp server");
                     Ok(())
                 }
                 result = Self::process_incoming_request(server_socket, sender) => {
@@ -45,10 +47,6 @@ impl UdpServer {
             sender.send(message).unwrap();
         }
     }
-
-    fn stop(self) {
-        self.cancellation_token.cancel();
-    }
 }
 
 #[derive(PartialEq)]
@@ -58,7 +56,7 @@ struct UdpMessage {
     socket_addr: SocketAddr,
 }
 
-struct UdpClient {
+pub struct UdpClient {
     socket: UdpSocket,
 }
 
@@ -68,7 +66,7 @@ impl UdpClient {
         return UdpClient { socket };
     }
 
-    async fn send_to(self, target: SocketAddr, content: Bytes) -> anyhow::Result<()> {
+    pub async fn send_to(self, target: SocketAddr, content: Bytes) -> anyhow::Result<()> {
         let mut content_ref = content;
         loop {
             let size = self.socket.send_to(content_ref.as_ref(), target).await?;
@@ -90,8 +88,11 @@ fn should_received_and_send_messages() {
         .build()
         .expect("Failed to create example_thread runtime");
     let server_address = SocketAddr::from_str("127.0.0.1:8080").unwrap();
-    let server = UdpServer::new(server_address);
-    let receiver = runtime.block_on(async { server.start().await.unwrap() });
+    let server_cancellation_token = CancellationToken::new();
+    let server = UdpServer::new(server_address, server_cancellation_token);
+    let receiver = runtime.block_on(async move {
+        server.start().await.unwrap()
+    });
 
     let client_address = SocketAddr::from_str("127.0.0.1:8081").unwrap();
     runtime.block_on(async move {
@@ -102,4 +103,30 @@ fn should_received_and_send_messages() {
     let result = receiver.recv().unwrap();
     let expected = UdpMessage { bytes: Bytes::from("test"), socket_addr: client_address };
     assert_eq!(expected, result)
+}
+
+#[test]
+fn stop_server(){
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("example_thread")
+        .enable_all()
+        .build()
+        .expect("Failed to create example_thread runtime");
+    let server_address = SocketAddr::from_str("127.0.0.1:8080").unwrap();
+    let server_cancellation_token = CancellationToken::new();
+    let toke_copy = server_cancellation_token.clone();
+    let server = UdpServer::new(server_address, server_cancellation_token);
+    let receiver = runtime.block_on(async move {
+        server.start().await.unwrap()
+    });
+    toke_copy.cancel();
+
+    let client_address = SocketAddr::from_str("127.0.0.1:8081").unwrap();
+    runtime.block_on(async move {
+        let client = UdpClient::new(client_address).await;
+        client.send_to(server_address, Bytes::from("test")).await.unwrap();
+    });
+
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    assert!(result.is_err())
 }
