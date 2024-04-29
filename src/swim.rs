@@ -11,6 +11,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use bytes_utils::Str;
 use rand::prelude::SliceRandom;
 use tokio_util::sync::CancellationToken;
+use crate::id::MemberId;
+use crate::membership_list::{MembershipList, MemberState, MemberStateType};
 
 use crate::network::{InboundMessage, InMemoryNetworkClient, NetworkClient, OutboundMessage};
 
@@ -22,11 +24,11 @@ struct Config {
 fn start_swim_member(config: Config,
                      cancellation_token: CancellationToken,
                      protocol_client_mutex: Arc<Mutex<dyn ProtocolClient>>,
-                     selection_strategy: Box<dyn SelectionStrategy>,
+                     membership_list: Arc<Mutex<MembershipList>>,
                      network_client: Box<dyn NetworkClient>,
                      receiver: Receiver<InboundMessage>) -> Vec<JoinHandle<()>> {
     let mut result = Vec::new();
-    result.push(start_gossip_thread(config, protocol_client_mutex.clone(), selection_strategy, network_client, cancellation_token.clone()));
+    result.push(start_gossip_thread(config, protocol_client_mutex.clone(), membership_list, network_client, cancellation_token.clone()));
     result.push(process_incoming_requests(protocol_client_mutex, receiver, cancellation_token));
     return result;
 }
@@ -54,26 +56,34 @@ fn process_incoming_requests(protocol_client_mutex: Arc<Mutex<dyn ProtocolClient
 
 fn start_gossip_thread(config: Config,
                        protocol_client_mutex: Arc<Mutex<dyn ProtocolClient>>,
-                       mut selection_strategy: Box<dyn SelectionStrategy>,
+                       membership_list_mutex: Arc<Mutex<MembershipList>>,
                        network_client: Box<dyn NetworkClient>,
                        cancellation_token: CancellationToken) -> JoinHandle<()> {
     return thread::spawn(move || {
         loop {
-            match selection_strategy.next() {
+            let membership_list = membership_list_mutex.lock().unwrap();
+            //TODO - we should pick ALIVE, SUSPECTED and suspected.time_to_transition >=DEAD.config
+            let random_members_op = membership_list.get_k_random_members(1,
+                                                                         |elem|
+                                                                             elem.member_state_type != MemberStateType::ALIVE &&
+                                                                             elem.member_state_type != MemberStateType::SUSPECTED);
+            drop(membership_list);
+            match random_members_op {
                 None => {
                     log::debug!("My membership list is empty. I will pause for {:?} and try to probe a member",
                         config.gossip_probe_period);
                     thread::sleep(config.gossip_probe_period);
                 }
                 Some(target) => {
+                    let target_state = &target[0];
                     let new_msg = {
                         let protocol_client = protocol_client_mutex.lock().unwrap();
                         protocol_client.new_message()
                     };
                     let before_probe = time::Instant::now();
-                    match network_client.send(OutboundMessage { content: new_msg, target_address: target }) {
-                        Ok(_) => { log::debug!("Successfully probe {:?}", target) }
-                        Err(err) => { log::debug!("Wasn't able to probe {:?}, {:?}", target, err) }
+                    match network_client.send(OutboundMessage { content: new_msg, target_address: target_state.socket_addr }) {
+                        Ok(_) => { log::debug!("Successfully probe {:?}", target_state.socket_addr) }
+                        Err(err) => { log::debug!("Wasn't able to probe {:?}, {:?}", target_state.socket_addr, err) }
                     }
                     let after_probe = time::Instant::now();
                     let duration_of_exec = after_probe.duration_since(before_probe);
@@ -94,39 +104,7 @@ fn start_gossip_thread(config: Config,
     });
 }
 
-trait SelectionStrategy: Sync + Send {
-    fn next(&mut self) -> Option<SocketAddr>;
-}
-
-struct RoundRobinSelectionStrategy {
-    members: Vec<SocketAddr>,
-    next_index: usize,
-}
-
-impl RoundRobinSelectionStrategy {
-    fn with_initial_list(initial_addresses: Vec<SocketAddr>) -> RoundRobinSelectionStrategy {
-        return RoundRobinSelectionStrategy { members: initial_addresses, next_index: 0 };
-    }
-}
-
-impl SelectionStrategy for RoundRobinSelectionStrategy {
-    fn next(&mut self) -> Option<SocketAddr> {
-        if self.members.is_empty() {
-            return None;
-        }
-        return if self.next_index < self.members.len() {
-            let result = self.members[self.next_index];
-            self.next_index += 1;
-            Some(result)
-        } else {
-            self.members.shuffle(&mut rand::thread_rng());
-            self.next_index = 0;
-            self.next()
-        };
-    }
-}
-
-trait ProtocolClient : Sync + Send {
+trait ProtocolClient: Sync + Send {
     fn new_message(&self) -> Bytes;
 
     fn merge(&mut self, remote_content: Bytes);
@@ -144,17 +122,18 @@ fn run_two_swim_members_with_in_memory_transport() {
     channel_map.insert(server_address_2, server2_sender);
 
     let cancellation_token = CancellationToken::new();
+    let membership_lists = create_two_membership_lists(server_address_1, server_address_2);
     let join_handlers1 = start_swim_member(Config { gossip_probe_period: Duration::from_secs(1) },
                                            cancellation_token.clone(),
                                            Arc::new(Mutex::new(MockProtocolClient::new(Bytes::from("c")))),
-                                           Box::new(RoundRobinSelectionStrategy::with_initial_list(vec![server_address_2])),
+                                           Arc::new(Mutex::new(membership_lists.0)),
                                            Box::new(InMemoryNetworkClient::new(channel_map.clone(), server_address_1)),
                                            server1_receiver);
 
     let join_handlers2 = start_swim_member(Config { gossip_probe_period: Duration::from_secs(1) },
                                            cancellation_token.clone(),
                                            Arc::new(Mutex::new(MockProtocolClient::new(Bytes::from("b")))),
-                                           Box::new(RoundRobinSelectionStrategy::with_initial_list(vec![server_address_1])),
+                                           Arc::new(Mutex::new(membership_lists.1)),
                                            Box::new(InMemoryNetworkClient::new(channel_map, server_address_2)),
                                            server2_receiver);
 
@@ -168,6 +147,17 @@ fn await_until_join(join_handlers: Vec<JoinHandle<()>>) {
     for join_handler in join_handlers {
         join_handler.join().expect("Fail in await");
     }
+}
+
+fn create_two_membership_lists(server_address_1: SocketAddr, server_address_2: SocketAddr) -> (MembershipList, MembershipList) {
+    let member_id_1 = MemberId::generate_random();
+    let member_id_2 = MemberId::generate_random();
+    let mut membership_list1 = MembershipList::new(member_id_1, server_address_1);
+    let mut membership_list2 = MembershipList::new(member_id_2, server_address_2);
+    membership_list1.merge(vec![MemberState::alive(member_id_2, server_address_2)]);
+    membership_list2.merge(vec![MemberState::alive(member_id_1, server_address_1)]);
+
+    return (membership_list1, membership_list2);
 }
 
 struct MockProtocolClient {
